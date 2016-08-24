@@ -1,0 +1,61 @@
+import requests
+from bs4 import BeautifulSoup, Comment
+import re
+import sys
+import string
+
+class Extract:
+
+    """
+    Need free (limited) application key to use Words API.
+    Get here: https://market.mashape.com/wordsapi/wordsapi
+    """
+    def __init__(self, wapikey):
+        self.wapi_head = {'X-Mashape-Key' : wapikey,
+                          'Accept'        : 'application/json'}
+        self.punctbl = str.maketrans(string.punctuation.replace("'", ''), " " * (len(string.punctuation)-1))
+
+    """
+    @:param url: url of site to be mined
+    @:return a dict including title, description, a list of images, and keywords
+    """
+    def mine(self, url):
+        data = {'title':'', 'desc':'', 'imgs':[], 'kw':[]}
+        tdict = {} #TF/IDF dictionary
+
+        doc = BeautifulSoup(requests.get(url).content, 'html.parser').html
+        #find all relevant text, excluding comments and scripts
+        doctext = ' '.join(doc.findAll(text=lambda text: not (isinstance(text, Comment) or text.parent.name=='script')))
+
+        doctext = doctext.translate(self.punctbl) #strip punctuation
+        words = doctext.split()
+        #calculate tf/retrieve idf
+        for word in words:
+            if word not in tdict:
+                #call WordsAPI
+                resp = requests.get('https://wordsapiv1.p.mashape.com/words/%s/frequency' % (word,), headers=self.wapi_head).json()
+                #resp = {'frequency':{'zipf':1}} #dummy response
+
+                #check for errors
+                if 'frequency' not in resp:
+                    #if word not found, probably proper noun/product name - no error
+                    if 'message' in resp and resp['message']=='word not found':
+                        tdict[word] = {'tf':1, 'idf':1} #don't convert to lowercase for proper noun
+                    else: #all other errors
+                        raise ValueError('Bad API response: %s' % (str(resp),))
+                else:
+                    #condition necessary because of weird format bug where sometimes zipf value is directly under frequency node
+                    freq = float(resp['frequency']['zipf'] if type(resp['frequency']) is dict else resp['frequency']) #haven't decided to use Zipf or perMillion yet...
+                    tdict[word.lower()] = {'tf':1, 'idf':freq}
+            else:
+                tdict[word]['tf'] += 1
+
+        terms = sorted(tdict.items(), key=lambda el: el[1]['tf']/el[1]['idf'], reverse=True) #sort descending by tf/idf ratio
+        print(len(terms))
+        print(terms)
+
+        return data
+
+#example
+e = Extract('Up5IpwRQ3Vmsh2it5N8Kn2NbtNmbp16gCJrjsnTSsjbHUYpxX6')
+e.mine('https://www.adxeed.com')
