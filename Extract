@@ -1,19 +1,25 @@
 import requests
 from bs4 import BeautifulSoup, Comment
-import re
-import sys
 import string
+import sys
+import math
 
 class Extract:
 
     """
-    Need free (limited) application key to use Words API.
-    Get here: https://market.mashape.com/wordsapi/wordsapi
+    Takes optional paramaters for what year range to use in ngram retrieval
     """
-    def __init__(self, wapikey):
-        self.wapi_head = {'X-Mashape-Key' : wapikey,
-                          'Accept'        : 'application/json'}
+    def __init__(self, ngram_year=2008, ngram_smooth=3):
         self.punctbl = str.maketrans(string.punctuation.replace("'", ''), " " * (len(string.punctuation)-1))
+        self.ngram_year = ngram_year
+        self.ngram_smooth = ngram_smooth
+
+    """
+    Generate a value representing a word's 'fitness' as a potential keyword, based on it's TF and IDF
+    Will and should be adjusted
+    """
+    def tfidfComp(self, tf, idf):
+        return tf/math.exp(idf)
 
     """
     @:param url: url of site to be mined
@@ -32,30 +38,45 @@ class Extract:
         #calculate tf/retrieve idf
         for word in words:
             if word not in tdict:
-                #call WordsAPI
-                resp = requests.get('https://wordsapiv1.p.mashape.com/words/%s/frequency' % (word,), headers=self.wapi_head).json()
-                #resp = {'frequency':{'zipf':1}} #dummy response
+                #retrieve unigram from Google
+                print(word)
+                resp = str(requests.get('https://books.google.com/ngrams/graph?content=%s&case_insensitive=on&year_start=%d&year_end=%d&corpus=15&smoothing=%d' % (word,self.ngram_year-1,self.ngram_year,self.ngram_smooth)).content)
+                start_idx = resp.find('var data')
 
-                #check for errors
-                if 'frequency' not in resp:
-                    #if word not found, probably proper noun/product name - no error
-                    if 'message' in resp and resp['message']=='word not found':
-                        tdict[word] = {'tf':1, 'idf':1} #don't convert to lowercase for proper noun
-                    else: #all other errors
-                        raise ValueError('Bad API response: %s' % (str(resp),))
-                else:
-                    #condition necessary because of weird format bug where sometimes zipf value is directly under frequency node
-                    freq = float(resp['frequency']['zipf'] if type(resp['frequency']) is dict else resp['frequency']) #haven't decided to use Zipf or perMillion yet...
-                    tdict[word.lower()] = {'tf':1, 'idf':freq}
+                if start_idx != -1:
+                    freqdat= eval(resp[resp.find('[', start_idx):resp.find(';', start_idx)]) #take selection with relevant data
+                    if freqdat == []: #blank response block
+                        tdict[word] = {'tf':1, 'idf':None}
+                    else:
+                        try:
+                            print(float(next(item for item in freqdat if item['type'] in ['CASE_INSENSITIVE', 'NGRAM'])['timeseries'][-1]))
+                            tdict[word.lower()] = {'tf':1, 'idf':float(next(item for item in freqdat if item['type'] in ['CASE_INSENSITIVE', 'NGRAM'])['timeseries'][-1])}
+                        except StopIteration:
+                            print(freqdat)
+                            sys.exit(1)
+                else:  #not in dictionary (probably some proper noun or brand/service name)
+                    if "try again later" in resp:
+                        #raise Exception("API not giving responses.") #it doesn't seem to like automated requests...
+                        words.append(word) #try again at end
+                        print("No response, will try again.")
+                        continue
+                    tdict[word] = {'tf':1, 'idf':None} #don't convert to lowercase for proper noun
             else:
                 tdict[word]['tf'] += 1
 
-        terms = sorted(tdict.items(), key=lambda el: el[1]['tf']/el[1]['idf'], reverse=True) #sort descending by tf/idf ratio
+        print(tdict)
+
+        minidf = min(tdict.items(), key=lambda item:item[1]['idf'] if item[1]['idf'] is not None else 100)[1]['idf']
+        for key in tdict:
+            if tdict[key]['idf']==None:
+                tdict[key]['idf'] = minidf
+
+        terms = sorted(tdict.items(), key=lambda el: self.tfidfComp(el[1]['tf'], el[1]['idf']), reverse=True) #sort descending by tf/idf ratio
         print(len(terms))
         print(terms)
 
         return data
 
 #example
-e = Extract('Up5IpwRQ3Vmsh2it5N8Kn2NbtNmbp16gCJrjsnTSsjbHUYpxX6')
+e = Extract()
 e.mine('https://www.adxeed.com')
