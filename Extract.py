@@ -7,6 +7,7 @@ import string
 import math
 from operator import itemgetter
 from functional import compose
+from itertools import groupby
 import re
 
 class Extract:
@@ -23,31 +24,30 @@ class Extract:
     """
     def __init__(self):
         self.punctbl = str.maketrans(string.punctuation.replace("'", ''), " " * (len(string.punctuation)-1)) #remove all except apostrophe
+        self.taglemma_props = '{"tokenize.whitespace":"true","annotators":"tokenize,pos,lemma","outputFormat":"json"}'
+        self.prefixes = ['ante', 'anti', 'circum', 'co', 'de', 'dis', 'em', 'en', 'epi', 'ex', 'extra', 'fore',
+                         'homo', 'hyper', 'il', 'im', 'in', 'ir', 'im', 'in', 'infra', 'inter', 'intra', 'macro',
+                         'micro', 'mid', 'mis', 'mono', 'non', 'omni', 'para', 'post', 'pre', 're', 'semi', 'sub',
+                         'super', 'therm', 'trans', 'tri', 'un', 'uni']
+        self.prefix_regexp = re.compile('^(' + ')|('.join(self.prefixes) + ').*')
+        self.num_regexp = re.compile('\\d+')
+        self.pos_filter = re.compile('^((JJ)|(NN)|(RB)|(VB)).*')
 
     """
-    Adapted from https://en.wikibooks.org/wiki/Algorithm_Implementation/Strings/Longest_common_substring
+    Weighted mean utility function
     """
-    def longest_common_substring(self, s1, s2):
-        m = [[0] * (1 + len(s2)) for i in range(1 + len(s1))]
-        longest, x_longest = 0, 0
-        for x in range(1, 1 + len(s1)):
-            for y in range(1, 1 + len(s2)):
-                if s1[x - 1] == s2[y - 1]:
-                    m[x][y] = m[x - 1][y - 1] + 1
-                    if m[x][y] > longest:
-                        longest = m[x][y]
-                        x_longest = x
-                else:
-                    m[x][y] = 0
-        return (x_longest-longest, s2.find(s1[x_longest - longest: x_longest]), longest, s1[x_longest - longest: x_longest])
+    def wavg(self, w, data):
+        assert len(w) == len(data)
+        return sum([w[i]*data[i] for i in range(len(w))]) / sum(w)
 
     """
     Generate a value representing a word's 'fitness' as a potential keyword, based on it's TF and IDF
     Will and should be changed
     """
     def termFitness(self, term):
-        dat = self.dict[term]
-        return math.log(dat[0])/dat[1] if dat[1] is not None else dat[0]*1000000000 #temporary solution
+        global dict
+        dat = dict[term]
+        return math.log(dat[0])/dat[3] if dat[3] is not None else dat[0]*1000000000 #temporary solution
 
     """
     Query SQL db for frequency of a word
@@ -73,14 +73,12 @@ class Extract:
     """
     def mine(self, url, params, sqlconn):
 
-        data = {'title':'', 'desc':'', 'imgs':[], 'kw':[]}
-
         doc = BeautifulSoup(requests.get(url).content, 'html.parser').html
         #Use test file...
         #with open('Test.html') as file:
         #    doc = BeautifulSoup(file.read(), 'html.parser').html
 
-        #for testing optimization... (ignore time needed to load page)
+        #for testing optimization... (ignore time needed to load page, varies and not relevant to optimiztion)
         self.starttime = time.clock()
 
         #find all relevant text, excluding comments and scripts
@@ -91,8 +89,8 @@ class Extract:
 
         cur = sqlconn.cursor()
 
-        dict = {} #all the info about a term - TF, IDF, etc.
-        self.dict = dict #for reference by other functions
+        global dict
+        dict = {} #all the info about a term - [TF, POS, lemma, IDF]
 
         #first count term frequency
         for word in words:
@@ -101,56 +99,59 @@ class Extract:
             else:
                 dict[word][0] += 1
 
-        #remove terms with a TF below tfCutoff
-        dict = {key:dict[key] for key in dict if dict[key][0] >= params['tfCutoff']}
-
         #remove blacklisted words
         for word in [w for w in dict.keys()]:
             cur.execute("select word from blacklist where word=%s;", (word,))
             r = cur.fetchall()
-            if r != []:
-                del dict[word]
-            if re.compile('\\d+').match(word):
+            if r != [] or self.num_regexp.match(word) or len(word)==1:
                 del dict[word]
 
-        #combine words with same root
-        plural = re.compile(',?e?s,?')
+        #check provided server URL
+        url = params['nlpserv_url']
+        if not url.endswith('/'):
+            url += '/'
 
-        keys = list(dict.keys())
-        group = [] #list of keys to group
+        #POS tag and lemma for each word
+        for word in [k for k in dict.keys()]:
+            pre = self.prefix_regexp.match(word)
+            if pre:
+                stripped = word[pre.endpos:]
+                origfreq = self.requestFreq(word, cur)
+                strfreq = self.requestFreq(stripped, cur)
+                if strfreq > origfreq if strfreq is not None and origfreq is not None else \
+                        (dict[stripped][0] > dict[word][0] if stripped in dict and word in dict else False): #if info not present in ngram db, defer to TF. If TF undefined, assume the words aren't related
+                    if stripped in dict:
+                        dict[stripped][0] += dict[word][0]
+                    else:
+                        dict[stripped][0] = dict[word][0]
+                    del dict[word]
+                    word = stripped
+            resp = requests.post('%s?properties=%s' % (url, self.taglemma_props), data=word).json()
+            dict[word].append(resp['sentences'][0]['tokens'][0]['pos'])
+            dict[word].append(resp['sentences'][0]['tokens'][0]['lemma'])
 
-        for w1idx in range(len(keys)):
-            for w2idx in range(w1idx, len(keys)):
-                w1 = keys[w1idx]
-                w2 = keys[w2idx]
-                if w1 != w2:
-                    pos1, pos2, l, sub = self.longest_common_substring(w1, w2)
-                    if l < params['groupCutoff']:
-                        continue
-                    pre = [w1[:pos1], w2[:pos2]]
-                    suf = [w1[pos1+l:], w2[pos2+l:]]
-                    if plural.match(','.join(suf)) and pre==['','']:
-                        group.append((w1, w2))
+            if not self.pos_filter.match(dict[word][1]): #filter out unnessecary POSs
+                del dict[word]
 
-        for g in group:
-            merger = g[0] if dict[g[0]][0] > dict[g[1]][0] else g[1] #group into one with higher TF
-            mergee = g[0] if merger==g[1] else g[1]
-            dict[merger][0] += dict[mergee][0]
-            del dict[mergee]
+        #group words with same lemma
+        tlist = sorted(list(dict.items()), key=compose(itemgetter(2), itemgetter(1))) #ordered by lemma
+        dict = {key:[sum([g[1][0] for g in groups]), groups[0][1][1][0:2], key] for (key, groups) in [(k, list(g)) for (k,g) in groupby(tlist, key=compose(itemgetter(2), itemgetter(1)))]}
+
+        #remove terms with a TF below tfCutoff
+        dict = {key:dict[key] for key in dict if dict[key][0] >= params['tfCutoff']}
 
         for word in dict:
             dict[word].append(self.requestFreq(word, cur))
 
-        print(sorted(dict.items(), key=compose(itemgetter(0), itemgetter(1)), reverse=True))
+        print('Term dictionary: [TF, POS, lemma, IDF]:')
+        print(dict)
 
         terms = sorted(dict.keys(), key=self.termFitness, reverse=True) #sort descending by "fitness" determined by self.tfidfComp
 
-        print(len(terms))
+        print('\nTerms ranked by fitness (%d total):' % len(terms))
         print(terms)
 
         print("Total time: %fs" % (time.clock()-self.starttime,))
-
-        return data
 
 #example
 config = {'user':'root',
@@ -162,5 +163,6 @@ conn = mysql.connector.connect(**config)
 
 e = Extract()
 params = {'tfCutoff': 4,
-          'groupCutoff': 3}
-e.mine('https://www.codingwithkids.com/#!/', params, conn)
+          'groupCutoff': 3,
+          'nlpserv_url': 'http://localhost:9000'}
+e.mine('https://adxeed.com/blog/view/Case+study%3A+How+cross-network+advertising+helps+improve+overall+ROI', params, conn)
